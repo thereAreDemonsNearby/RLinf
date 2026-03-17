@@ -372,7 +372,7 @@ class ReasoningRunner:
             initial=self.global_steps,
             total=self.max_steps,
             desc="Global Step",
-            ncols=620,
+            ncols=1650,
         )
 
         self.run_timer.start_time()

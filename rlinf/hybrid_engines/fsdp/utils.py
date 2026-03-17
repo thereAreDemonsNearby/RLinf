@@ -117,6 +117,11 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         default_transformer_cls_names_to_wrap = getattr(
             module.language_model, "_no_split_modules", None
         )
+
+        if hasattr(module, "visual"):
+            default_transformer_cls_names_to_wrap.extend(
+                getattr(module.visual, "_no_split_modules", None)
+            )
     else:
         # For standard models, get transformer classes directly from module
         default_transformer_cls_names_to_wrap = getattr(
@@ -295,10 +300,17 @@ def apply_fsdp2_to_model(
         default_transformer_cls_names_to_wrap = getattr(
             module.language_model, "_no_split_modules", None
         )
+
+        if hasattr(module, "visual"):
+            default_transformer_cls_names_to_wrap.extend(
+                getattr(module.visual, "_no_split_modules", None)
+            )
     else:
         default_transformer_cls_names_to_wrap = getattr(
             module, "_no_split_modules", None
         )
+
+    print(f'fsdp default_transformer_cls_names_to_wrap is {default_transformer_cls_names_to_wrap}')
 
     fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
@@ -658,11 +670,12 @@ def pack_sequences(
     for idx in range(input_tensor.shape[0]):
         input_tensors_rm_pad.append(input_tensor[idx, idx_starts[idx] : idx_ends[idx]])
 
-    if pad_len > 0:
+    # TODO remember to reconsider this
+    """ if pad_len > 0:
         pad_tensor = torch.full(
             (pad_len,), pad_val, dtype=input_tensor.dtype, device=input_tensor.device
         )
-        input_tensors_rm_pad.append(pad_tensor)
+        input_tensors_rm_pad.append(pad_tensor) """
 
     # [1, max_seq_len]
     output_tensor = torch.cat(input_tensors_rm_pad)
@@ -827,3 +840,59 @@ def unpack_fsdp_logprobs(
         logprobs, idx_starts, idx_ends, max_seq_len_unpack, pad_val=0
     )
     return logprobs
+
+def remove_left_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+):
+    """
+    Remove left padding from input_ids, attention_mask and position_ids
+    return new_input_ids, new_attention_mask, new_position_ids
+    """
+    assert attention_mask.ndim == 2
+    assert position_ids.ndim == 2
+
+    batch_size = input_ids.shape[0]
+    shape = list(input_ids.shape)  # batch_size, seq_len,...
+    seq_lens = attention_mask.sum(dim=1)
+    seq_len = seq_lens.max().item()
+    shape[1] = seq_len
+
+    new_input_ids = torch.zeros(
+        dtype=input_ids.dtype, device=input_ids.device, size=shape
+    )
+
+    new_attention_mask = torch.zeros(
+        dtype=attention_mask.dtype,
+        device=attention_mask.device,
+        size=(batch_size, seq_len),
+    )
+    new_position_ids = torch.zeros(
+        dtype=position_ids.dtype, device=position_ids.device, size=(batch_size, seq_len)
+    )
+    for i in range(batch_size):
+        new_input_ids[i, : seq_lens[i]] = input_ids[i, attention_mask[i]]
+        new_attention_mask[i, : seq_lens[i]] = attention_mask[i, attention_mask[i]]
+        new_position_ids[i, : seq_lens[i]] = position_ids[i, attention_mask[i]]
+
+    return new_input_ids, new_attention_mask, new_position_ids
+
+
+def recover_left_padding(
+    result,
+    attention_mask: torch.Tensor,
+    original_attention_mask: torch.Tensor,
+    origin_seqlen: int,
+):
+    """
+    Recover left padding from result
+    return result
+    """
+    shape = list(result.shape)
+    batch_size = shape[0]
+    shape[1] = origin_seqlen
+    new_result = torch.zeros(dtype=result.dtype, device=result.device, size=shape)
+    for i in range(batch_size):
+        new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
+    return new_result

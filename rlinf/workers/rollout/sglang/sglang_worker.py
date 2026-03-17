@@ -18,6 +18,8 @@ import dataclasses
 from typing import Any, Literal, Optional
 
 from omegaconf import DictConfig
+import sglang
+print(f'sglang path is {sglang.__file__}')
 from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -156,6 +158,8 @@ class SGLangWorker(Worker):
         else:
             load_format = "auto"
 
+        random_seed = (self._cfg_rollout.seed + self._rank if 'seed' in self._cfg_rollout.seed else None)
+
         server_args = ServerArgs(
             model_path=self._cfg_rollout.model.model_path,
             disable_cuda_graph=not use_cudagraph,
@@ -183,6 +187,7 @@ class SGLangWorker(Worker):
             log_level="info",
             max_running_requests=self._cfg_rollout.max_running_requests,
             dist_init_addr=f"127.0.0.1:{str(self.acquire_free_port())}",
+            random_seed=random_seed
         )
 
         self.log_on_first_rank(f"{server_args=}")

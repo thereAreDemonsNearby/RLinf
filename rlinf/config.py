@@ -46,6 +46,7 @@ class SupportedModel(Enum):
     QWEN2_5 = ("qwen2.5", "reasoning")
     QWEN2_5_VL = ("qwen2.5_vl", "reasoning")
     QWEN3 = ("qwen3", "reasoning")
+    QWEN3_VL = ("qwen3_vl", "reasoning")
     QWEN3_MOE = ("qwen3_moe", "reasoning")
 
     # Embodied models

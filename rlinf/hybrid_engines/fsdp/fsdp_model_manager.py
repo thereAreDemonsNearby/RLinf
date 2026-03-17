@@ -22,6 +22,7 @@ from omegaconf import DictConfig
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
+import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 
 from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
@@ -37,6 +38,9 @@ from rlinf.hybrid_engines.fsdp.utils import (
 )
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import warmup_optimizer_state
+
+# Double-check which transformers is loaded (for TRANSFORMERS_LIB_PATH comparison experiments)
+get_logger().info(f"transformers.__file__ = {transformers.__file__}")
 
 warnings.filterwarnings(
     "ignore",
@@ -61,6 +65,13 @@ class FSDPModelManager:
         self._cfg = cfg
         self._logger = get_logger()
         self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
+        if self.torch_dtype != torch.float32:
+            self._logger.warning("Provided there is sufficient GPU memory, "
+                                 "set the actor.model.precision parameter to fp32 "
+                                 "to allow the optimizer to run in fp32 for better convergence. "
+                                 "Meanwhile, setting mixed_precision.param_dtype to 16-bit dtype "
+                                 "can help maximize speed, as it will automatically "
+                                 "convert fp32 to fp16 during operator execution.")
 
         self.optimizer_steps = 0
         self.critic_warmup_steps = 0
@@ -241,7 +252,9 @@ class FSDPModelManager:
         # Enable gradient checkpointing if configured
         if self._cfg.fsdp_config.get("gradient_checkpointing", False):
             self._logger.info("[FSDP] Enabling gradient checkpointing")
-            module.gradient_checkpointing_enable()
+            use_reentrant = self._cfg.fsdp_config.get("gradient_checkpointing_use_reentrant", True)
+            module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
         else:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
 
@@ -284,6 +297,13 @@ class FSDPModelManager:
         Args:
             load_path: the directory to load checkpoint.
         """
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+            self.is_weight_offloaded = False
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+            self.is_optimizer_offloaded = False
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )

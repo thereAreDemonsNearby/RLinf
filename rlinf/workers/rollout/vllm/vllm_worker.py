@@ -332,6 +332,7 @@ class VLLMWorker(Worker):
         If mode is collocated, it will additionally offload model weights,
         ready to use parameters sent from actor.
         """
+        random_seed = (self._cfg_rollout.seed + self._rank if 'seed' in self._cfg_rollout.seed else None)
         engine_args: EngineArgs = EngineArgs(
             model=self._cfg.rollout.model.model_path,
             tensor_parallel_size=self._cfg.rollout.tensor_parallel_size,
@@ -348,6 +349,9 @@ class VLLMWorker(Worker):
             max_num_seqs=self._cfg.rollout.max_running_requests,
             enable_sleep_mode=True,  # it enables offload weights
         )
+        if random_seed is not None:
+            engine_args.seed = random_seed
+
         vllm_config: VllmConfig = engine_args.create_engine_config()
 
         # here to set the customed worker class for VLLM engine

@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Union
 
 import pandas as pd
 import torch
+import numpy as np
 from omegaconf import DictConfig
 from PIL import Image
 from torch.utils.data import Dataset
@@ -28,7 +29,33 @@ from transformers import AutoProcessor, AutoTokenizer
 from rlinf.data.datasets.item import DatasetItem
 from rlinf.data.utils import batch_pad_to_fixed_len
 
+class VLMDatasetRegistry:
+    registry: dict[str, Callable[..., "VLMBaseDataset"]] = {}
 
+    @classmethod
+    def register(
+        cls, name: str
+    ) -> Callable[[Callable[..., "VLMBaseDataset"]], Callable[..., "VLMBaseDataset"]]:
+        def decorator(klass: Callable[..., "VLMBaseDataset"]):
+            cls.registry[name] = klass
+            return klass
+
+        return decorator
+
+    @classmethod
+    def create(
+        cls,
+        dataset_name: Optional[str],
+        *,
+        data_paths: Union[list[str], str],
+        config: DictConfig,
+        tokenizer: AutoTokenizer,
+    ) -> "VLMBaseDataset":
+        key = dataset_name.lower()
+        dataset_class = cls.registry.get(key)
+        return dataset_class(data_paths=data_paths, config=config, tokenizer=tokenizer)
+
+@VLMDatasetRegistry.register("base")
 class VLMBaseDataset(Dataset):
     def __init__(
         self,
@@ -46,6 +73,7 @@ class VLMBaseDataset(Dataset):
         self._processor = None
 
         self.system_prompt = config.data.get("system_prompt", None)
+        self.system_prompt_as_user = config.data.get("system_prompt_as_user", False)
         self.use_chat_template = bool(config.data.use_chat_template)
         self.image_keys = list(config.data.image_keys or [])
         self.prompt_key = config.data.prompt_key
@@ -104,6 +132,9 @@ class VLMBaseDataset(Dataset):
                 images.append(v)
             elif isinstance(v, dict) and "bytes" in v:
                 images.append(v["bytes"])
+            elif isinstance(v, np.ndarray) and 'bytes' in v[0]: # TODO check if necessary
+                for p in v:
+                    images.append(p['bytes'])
             else:
                 images.append(v)  # path or url
         if not images:
@@ -133,15 +164,20 @@ class VLMBaseDataset(Dataset):
                     self.cfg.actor.model.model_path
                 )
             messages = []
-            if self.system_prompt is not None:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": [{"type": "text", "text": self.system_prompt}],
-                    }
-                )
+            if not self.system_prompt_as_user:
+                if self.system_prompt is not None:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": [{"type": "text", "text": self.system_prompt}],
+                        }
+                    )
 
             content: list[dict[str, Any]] = []
+            if self.system_prompt_as_user:
+                if self.system_prompt is not None:
+                    print('system prompt is treated as the first sentence as user prompt')
+                    content.append({"type": "text", "text": self.system_prompt})
             for _ in range(max(0, len(images))):
                 content.append({"type": "image"})
             content.append({"type": "text", "text": prompt_text})
@@ -157,6 +193,9 @@ class VLMBaseDataset(Dataset):
                     image_obj = image.convert("RGB")
                 if isinstance(image, (bytes, bytearray)):
                     image_obj = Image.open(BytesIO(image)).convert("RGB")
+                if image_obj is None:
+                    raise ValueError(f"image is of type {type(image)}, {image}")
+
                 images_inputs.append(image_obj)
 
             inputs = self._processor(
@@ -354,34 +393,6 @@ class VLMBaseDataset(Dataset):
             multi_modal_inputs=multi_modal_inputs,
         )
         return self.postprocess_dataset_item(item, raw)
-
-
-class VLMDatasetRegistry:
-    registry: dict[str, Callable[..., VLMBaseDataset]] = {}
-
-    @classmethod
-    def register(
-        cls, name: str
-    ) -> Callable[[Callable[..., VLMBaseDataset]], Callable[..., VLMBaseDataset]]:
-        def decorator(klass: Callable[..., VLMBaseDataset]):
-            cls.registry[name] = klass
-            return klass
-
-        return decorator
-
-    @classmethod
-    def create(
-        cls,
-        dataset_name: Optional[str],
-        *,
-        data_paths: Union[list[str], str],
-        config: DictConfig,
-        tokenizer: AutoTokenizer,
-    ) -> VLMBaseDataset:
-        key = dataset_name.lower()
-        dataset_class = cls.registry.get(key)
-        return dataset_class(data_paths=data_paths, config=config, tokenizer=tokenizer)
-
 
 @VLMDatasetRegistry.register("robo2vlm")
 class Robo2VLMDataset(VLMBaseDataset):

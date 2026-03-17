@@ -168,16 +168,18 @@ class FSDP2Strategy(FSDPStrategyBase):
         Returns:
             - float: The total norm of the gradients before clipping.
         """
-        grad_norm = get_grad_norm(
-            model.parameters(),
-            dp_group=self._dp_group,
-            norm_type=norm_type,
-        )
-        clip_grad_by_total_norm_(
-            model.parameters(),
-            max_grad_norm=self.cfg.optim.clip_grad,
-            total_norm=grad_norm,
-        )
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.optim.clip_grad)
+        grad_norm = float(grad_norm)
+        # grad_norm = get_grad_norm(
+        #     model.parameters(),
+        #     dp_group=self._dp_group,
+        #     norm_type=norm_type,
+        # )
+        # clip_grad_by_total_norm_(
+        #     model.parameters(),
+        #     max_grad_norm=self.cfg.optim.clip_grad,
+        #     total_norm=grad_norm,
+        # )
         return grad_norm
 
     def before_micro_batch(

@@ -16,9 +16,11 @@ import os
 import time
 from functools import partial
 from typing import Optional
+import copy
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -37,9 +39,12 @@ from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
 )
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
+    pack_sequences,
     prepare_pack_fsdp,
     unpack_fsdp_logprobs,
     unpack_sequences,
+    remove_left_padding,
+    recover_left_padding,
 )
 from rlinf.models import get_model
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
@@ -202,6 +207,9 @@ class FSDPActor(FSDPModelManager, Worker):
         self.max_tokens_per_mbs = cfg.runner.get("max_tokens_per_mbs", 2048)
 
         self.bucket_capacity = 128 * 1024 * 1024
+
+        print(f'logits_to_float_pre_div: {self.cfg.runner.get("logits_to_float_pre_div", True)}, logits_to_float_post_div: {self.cfg.runner.get("logits_to_float_post_div", False)}')
+
 
     def init_worker(self) -> None:
         """
@@ -488,6 +496,11 @@ class FSDPActor(FSDPModelManager, Worker):
         attention_mask = m_batch["attention_mask"]
         position_ids = m_batch["position_ids"]
 
+        remove_padding = self.cfg.runner.get("remove_padding", False)
+        logits_to_float_pre_div = self.cfg.runner.get("logits_to_float_pre_div", True)
+        logits_to_float_post_div = self.cfg.runner.get("logits_to_float_post_div", False)
+        assert not (logits_to_float_pre_div and logits_to_float_post_div)
+
         multi_modal_inputs = {}
         if "multi_modal_inputs" in m_batch.keys():
             for key in m_batch["multi_modal_inputs"][0].keys():
@@ -496,7 +509,12 @@ class FSDPActor(FSDPModelManager, Worker):
                     dim=0,
                 ).cuda()
 
-        if self.enable_dynamic_batch_size:
+        # TODO verify this
+        label = copy.deepcopy(input_ids)
+        label[:, -1] = 0
+        label[:, :-1] = input_ids[:, 1:]
+
+        if self.enable_dynamic_batch_size or remove_padding:
             max_seq_len_pack = self.max_tokens_per_mbs
             max_seq_len_unpack = self.cfg.actor.model.encoder_seq_length
             max_prompt_len = self.cfg.data.max_prompt_length
@@ -511,6 +529,15 @@ class FSDPActor(FSDPModelManager, Worker):
                 max_seq_len_pack=max_seq_len_pack,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
+            label = pack_sequences(
+                    label, idx_starts, idx_ends, max_seq_len_pack, self.tokenizer.eos_token_id,
+                ).unsqueeze(0)
+        elif self.cfg.runner.get("remove_left_padding", False):
+            # TODO test this remove_left_padding
+            original_attention_mask = attention_mask
+            original_seq_length = original_attention_mask.shape[1]
+            original_input_ids = input_ids
+            input_ids, attention_mask, position_ids = remove_left_padding(input_ids, attention_mask, position_ids)
 
         with self.amp_context:
             outputs = self.model(
@@ -522,9 +549,15 @@ class FSDPActor(FSDPModelManager, Worker):
             )
 
         logits: torch.Tensor = outputs.logits
+
+        if logits_to_float_pre_div:
+            logits = logits.float() # TODO verify this
         logits.div_(self.cfg.algorithm.sampling_params.temperature)
-        if self.enable_dynamic_batch_size:
-            logprobs = unpack_fsdp_logprobs(
+        if logits_to_float_post_div:
+            logits = logits.float() # TODO verify this
+
+        if self.enable_dynamic_batch_size or remove_padding:
+            logprobs2 = unpack_fsdp_logprobs(
                 logits,
                 input_ids,
                 idx_starts=idx_starts,
@@ -533,19 +566,38 @@ class FSDPActor(FSDPModelManager, Worker):
                 eos_token_id=self.tokenizer.eos_token_id,
                 compute_logprobs_fn=self.compute_logprobs,
             )
+            logprobs2 = logprobs2[:, -max_response_len:]
+
+            logprobs = compute_logprobs_from_logits(logits, label, op_type=self.entropy_op_type)
+
+            logprobs = F.pad(logprobs[:, :-1], (1, 0)) # right shift logprobs
+            logprobs = unpack_sequences(logprobs, idx_starts, idx_ends, max_seq_len_unpack, pad_val=0)
             logprobs = logprobs[:, -max_response_len:]
+
+            breakpoint()
         else:
+            if self.cfg.runner.get("remove_left_padding", False):
+                # TODO recover left padding, verify this
+                # print(f'logits shape before recover is {logits.shape}, original_seq_length is {original_seq_length}')
+                logits = recover_left_padding(logits, attention_mask, original_attention_mask, original_seq_length)
+                input_ids = recover_left_padding(input_ids, attention_mask, original_attention_mask, original_seq_length)
+
             # (bsz, response_length, vocab_size)
             logits = logits[:, -self.response_len - 1 : -1, :]
             responses = input_ids[:, -self.response_len :]
             logprobs = self.compute_logprobs(logits, responses)
+
         if calculate_entropy:
-            entropy = compute_entropy_from_logits(logits)
-            if self.enable_dynamic_batch_size:
+            entropy = compute_entropy_from_logits(logits * self.cfg.algorithm.sampling_params.temperature) # TODO verify this
+
+            # entropy = F.pad(entropy[:, :-1], (1, 0)) # right shift # TODO do we need this?
+            if self.enable_dynamic_batch_size or remove_padding:
                 entropy = unpack_sequences(
                     entropy, idx_starts, idx_ends, max_seq_len_unpack, pad_val=0
                 )[:, -self.response_len :]
+
             return logprobs, entropy
+
         return logprobs
 
     def inference_step(

@@ -28,6 +28,8 @@ from sympy.parsing.sympy_parser import parse_expr
 
 from toolkits.math_verifier.parser import extract_answer
 
+import slime_math_verify
+
 global_executor = ProcessPoolExecutor(max_workers=40)
 
 
@@ -380,9 +382,12 @@ def reset_global_process_pool():
     global_executor = ProcessPoolExecutor(max_workers=40)
 
 
-def verify_math_solution(answer: str, solution: str):
-    return process_results(answer, solution)[0]
+# def verify_math_solution(answer: str, solution: str):
+#     return process_results(answer, solution)[0]
 
+def verify_math_solution(gen: str, ground_truth: str):
+    # return process_results(answer, solution)[0]
+    return slime_math_verify.grade_answer_verl(gen, ground_truth)
 
 def math_verify_call(
     responses: list[str],
@@ -398,8 +403,13 @@ def math_verify_call(
     all_jobs = []
     for solutions, gen in zip(references, responses):
         jobs = []
-        for sol in solutions:
-            job = global_executor.submit(verify_math_solution, gen, sol)
+        if isinstance(solutions, list):
+            for sol in solutions:
+                job = global_executor.submit(verify_math_solution, gen, sol)
+                jobs.append(job)
+            all_jobs.append(jobs)
+        else:
+            job = global_executor.submit(verify_math_solution, gen, solutions)
             jobs.append(job)
         all_jobs.append(jobs)
 
