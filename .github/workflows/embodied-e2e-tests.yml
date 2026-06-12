@@ -319,6 +319,16 @@ jobs:
           export ISAAC_PATH=/workspace/dataset/isaac-sim
           bash tests/e2e_tests/embodied/run.sh behavior_ppo_openpi
 
+      - name: BEHAVIOR-OpenPI with torch.compile test
+        timeout-minutes: 30
+        run: |
+          unset PYTHONPATH
+          export REPO_PATH=$(pwd)
+          source .venv/bin/activate
+          export OMNIGIBSON_DATA_PATH=/workspace/dataset/behavior-datasets
+          export ISAAC_PATH=/workspace/dataset/isaac-sim
+          bash tests/e2e_tests/embodied/run.sh behavior_ppo_openpi_torch_compile
+
       - name: Clean up
         run: |
           rm -rf .venv

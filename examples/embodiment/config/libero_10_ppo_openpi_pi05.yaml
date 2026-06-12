@@ -15,14 +15,17 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    # env: 0
+    # rollout: 1
+    # actor: 0,1
+    env,rollout,actor: all
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_10_ppo_openpi_pi05"
+    experiment_name: "libero_10_ppo_openpi_pi05_compile"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -86,7 +89,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 64
+    total_num_envs: 32
     max_episode_steps: 480 # max episode steps for truncation
     max_steps_per_rollout_epoch: 480
     reward_coef: ${algorithm.reward_coef}
@@ -108,7 +111,7 @@ rollout:
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10
-  enable_offload: False
+  enable_offload: True
   pipeline_stage_num: 1
 
   # you can enable torch compile by uncomment the following 2 lines:
@@ -116,20 +119,20 @@ rollout:
   # torch_compile_mode: "max-autotune"
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: "/mnt/public/daibo/models/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
+  micro_batch_size: 64
   global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
-  enable_offload: False
+  enable_offload: True
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: ${rollout.model.model_path} # https://huggingface.co/RLinf/RLinf-Pi05-SFT
     model_type: "openpi"
     add_value_head: True
     # openpi specific parameters
@@ -152,12 +155,12 @@ actor:
   # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
+    sharding_strategy: "full_shard"
     gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
     mixed_precision:
       param_dtype: ${actor.model.precision}
-      reduce_dtype: ${actor.model.precision}
-      buffer_dtype: ${actor.model.precision}
+      reduce_dtype: "fp32"
+      buffer_dtype: "fp32"
 
 reward:
   use_reward_model: False

@@ -1,0 +1,14 @@
+defaults:
+  - ./behavior_ppo_openpi.yaml
+
+# hydra:
+#   run:
+#     dir: .
+#   output_subdir: null
+#   searchpath:
+#     - file://${oc.env:REPO_PATH}/examples/embodiment/config
+
+
+rollout:
+  enable_torch_compile: True
+  torch_compile_mode: "max-autotune"

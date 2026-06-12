@@ -592,6 +592,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self._preprocess_observation(observation, train=False)
         )
 
+        event_before_vision = torch.cuda.Event(enable_timing=True) # timing
+        event_before_lm = torch.cuda.Event(enable_timing=True) # timing
+        event_before_denoise = torch.cuda.Event(enable_timing=True) # timing
+        event_after_denoise = torch.cuda.Event(enable_timing=True) # timing
+
+        event_before_vision.record()
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
@@ -602,6 +609,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        event_before_lm.record()
         (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -645,6 +653,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             denoise_inds = torch.tensor([-1] * num_steps)
         denoise_inds = denoise_inds[None].repeat(bsize, 1)
 
+        event_before_denoise.record()
+
         # denoise step
         for idx in range(num_steps):
             # sample mean var val
@@ -675,11 +685,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         log_probs = torch.stack(log_probs, dim=1)[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
         ]
+
+        event_after_denoise.record()
+
         if self.config.joint_logprob:
             log_probs = log_probs.mean(dim=1)
         else:
             log_probs = log_probs[
-                torch.arange(log_probs.shape[0]),
+                torch.arange(log_probs.shape[0], device=device),
                 denoise_inds[:, 0],
             ]
         # post process for value
@@ -693,6 +706,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_logprobs": log_probs,
             "prev_values": values,
             "denoise_inds": denoise_inds,
+            "timing_events": [event_before_vision, event_before_lm, event_before_denoise, event_after_denoise]
         }
 
     def sample_mean_var_val(
@@ -714,7 +728,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         bsize = state.shape[0]
         device = state.device
         if isinstance(idx, int):
-            idx = torch.tensor(idx).expand(bsize)
+            idx = torch.full((), idx, device=device).expand(bsize)
         # build parameters
         if self.config.noise_anneal:
             # noise annealing
@@ -725,12 +739,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 * min(self.global_step, anneal_steps)
                 / anneal_steps
             )
-            noise_level = torch.tensor(noise_level).to(device)
+            noise_level = torch.full((), noise_level, device=device)
         else:
             # fixed noise level
-            noise_level = torch.tensor(self.config.noise_level).to(device)
+            noise_level = torch.full((), self.config.noise_level, device=device)
         timesteps = torch.linspace(1, 1 / denoise_steps, denoise_steps, device=device)
-        timesteps = torch.cat([timesteps, torch.tensor([0.0], device=device)])
+        timesteps = torch.cat([timesteps, torch.zeros((1), device=device)])
         # input parameters
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1]
@@ -773,6 +787,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             x_t_std = torch.zeros_like(t_input)
         elif mode == "train":
             if self.config.noise_method == "flow_sde":
+
+                # @torch.compiler.disable
+                # def compute_sigmas():
+                #     sigmas = (
+                #         noise_level
+                #         * torch.sqrt(
+                #             timesteps
+                #             / (1 - torch.where(timesteps == 1, timesteps[1], timesteps))
+                #         )[:-1]
+                #     )
+                #     return sigmas
+
+                # sigmas = compute_sigmas()
+
                 sigmas = (
                     noise_level
                     * torch.sqrt(
@@ -1275,8 +1303,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if self.torch_compile_enabled:
             return
 
-        self.paligemma_with_expert.paligemma.model.vision_tower = torch.compile(
-            self.paligemma_with_expert.paligemma.model.vision_tower, mode=mode
+        self.paligemma_with_expert.paligemma.model.vision_tower.forward = torch.compile(
+            self.paligemma_with_expert.paligemma.model.vision_tower.forward, mode=mode
         )
 
         # NOTE: paligemma.model.language_model and gemma_expert.model share the same LLM backbone.
@@ -1284,12 +1312,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # tensor aliasing in the shared computation graph). We disable cuda graph for
         # paligemma.model.language_model since it is not CPU-bound, while gemma_expert.model
         # benefits more from cuda graph.
-        self.paligemma_with_expert.paligemma.model.language_model = torch.compile(
-            self.paligemma_with_expert.paligemma.model.language_model,
+        self.paligemma_with_expert.paligemma.model.language_model.forward = torch.compile(
+            self.paligemma_with_expert.paligemma.model.language_model.forward,
             mode="max-autotune-no-cudagraphs" if mode == "max-autotune" else mode,
         )
-        self.paligemma_with_expert.gemma_expert.model = torch.compile(
-            self.paligemma_with_expert.gemma_expert.model, mode=mode, fullgraph=True
+        self.paligemma_with_expert.gemma_expert.model.forward = torch.compile(
+            self.paligemma_with_expert.gemma_expert.model.forward, mode=mode, fullgraph=True
         )
+
+        # self.sample_mean_var_val = torch.compile(self.sample_mean_var_val, mode="reduce-overhead")
+        self.get_logprob_norm = torch.compile(self.get_logprob_norm, mode="max-autotune-no-cudagraphs")
 
         self.torch_compile_enabled = True
