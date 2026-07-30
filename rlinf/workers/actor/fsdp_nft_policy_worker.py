@@ -46,6 +46,7 @@ class EmbodiedNFTFSDPPolicy(EmbodiedFSDPActor):
     def init_rollout_model(self) -> None:
         """Initialize rollout model state for off-policy support."""
         self.rollout_model_state_dict = {}
+        self._cached_ref_model = None
         tau = self.cfg.algorithm.get("nft_tau", 1.0)
         if isinstance(tau, ListConfig):
             tau = list(tau)
@@ -265,17 +266,27 @@ class EmbodiedNFTFSDPPolicy(EmbodiedFSDPActor):
             # On-policy: use training model directly
             ref_model = self.model
         else:
-            # Off-policy: build a temporary model with lagged rollout weights
+            # Off-policy: use cached ref model with lagged rollout weights
             training_was_on_device = not self.is_weight_offloaded
             if training_was_on_device:
                 self.offload_param_and_grad()
                 clear_memory()
 
-            ref_model = self.model_provider_func()
-            ref_model.load_state_dict(self.get_rollout_state_dict(), strict=False)
-            ref_model.eval()
-            ref_model.requires_grad_(False)
+            if self._cached_ref_model is None:
+                ref_model = self.model_provider_func()
+                ref_config = getattr(ref_model, "config", None)
+                if hasattr(ref_config, "compile_transformer_forward"):
+                    ref_config.compile_transformer_forward = False
+                ref_model.eval()
+                ref_model.requires_grad_(False)
+                self._cached_ref_model = ref_model
+            else:
+                ref_model = self._cached_ref_model
+
             ref_model.to(self.device)
+            ref_model.load_state_dict(
+                self.get_rollout_state_dict(), strict=False
+            )
             cleanup_rollout_model = True
 
         with torch.no_grad():
@@ -297,7 +308,7 @@ class EmbodiedNFTFSDPPolicy(EmbodiedFSDPActor):
                 v_old_buffer.append(out["v_theta"].detach().cpu())
 
         if cleanup_rollout_model:
-            del ref_model
+            self._cached_ref_model.to("cpu")
             clear_memory()
             if training_was_on_device:
                 self.load_param_and_grad(self.device)
